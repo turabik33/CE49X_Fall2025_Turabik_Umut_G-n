@@ -1,0 +1,458 @@
+"""
+Umut Gün Turabik
+2021403171
+Lab 3 — ERA5 Weather Data Analysis (Berlin vs Munich)
+-----------------------------------------------------
+This script fulfills the requirements described in the Lab 3 handout:
+
+- Load ERA5 wind datasets for Berlin and Munich (CSV).
+- Compute wind speed from u10m and v10m.
+- Explore datasets: info, missing values, summary statistics.
+- Compute monthly and seasonal averages; compare the two cities.
+- Identify extreme wind days and analyze diurnal (hourly) patterns.
+- Produce at least 3 visualizations (time series, seasonal bars, diurnal profile).
+- Modular code with docstrings and basic error handling.
+- (Bonus) Placeholders for cross-checking extreme events with news.
+- (Repo task) Include a short description for the Skyrim project in a separate markdown file.
+
+Run this script from your project root or from /labs/lab3/ like:
+    python lab3_era5_analysis.py \
+        --berlin berlin_era5_wind_20241231_20241231.csv \
+        --munich munich_era5_wind_20241231_20241231.csv
+
+If run without arguments, the script will look for CSVs in the current directory.
+"""
+
+from __future__ import annotations #str veye int direkt bakma , bekle acele etme tipi daha sonra kontrol et
+
+import argparse #bilgisayara verdiğin terminalden argumanları anlamdırıyor
+import sys #kodunu anlıyor termina
+import os #bilgisayardaki dosyalarla uğraşmak için
+from typing import Tuple, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Utility / I/O
+# -----------------------------
+
+def safe_read_csv(path: str) -> pd.DataFrame:
+    """
+    Read a CSV file with robust parsing of datetime columns if present.
+    Returns an empty DataFrame if the file is missing and prints a clear message.
+    """
+    if not os.path.exists(path): #file var mı diye kontrol ediyor
+        print(f"[WARN] File not found: {path}") 
+        return pd.DataFrame() #file yoksa boş dataframe döndürüyor bozulmasın diye
+
+    try:
+        # Try to parse common datetime columns automatically
+        df = pd.read_csv(path, parse_dates=True, infer_datetime_format=True) #file oku ve datetime kolonlarını otomatik olarak tahmin et
+    except Exception as e:
+        print(f"[ERROR] Could not read {path}: {e}")
+        return pd.DataFrame()
+
+    # If there's an obvious datetime column name, convert it
+    for cand in ["time", "timestamp", "date", "datetime"]: #bunların hepsi datetime kolonu olabilir,ve kesin olarak tarih olarak algılamak için
+        if cand in df.columns:
+            try:
+                df[cand] = pd.to_datetime(df[cand], errors="coerce")
+            except Exception:
+                pass
+
+    return df
+
+
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame: #Genel tablo verilerini kontrol etmek ve temizlemek için
+    """
+    Make column names lowercase and strip spaces to reduce case/typo issues.
+    """
+    if df.empty: #Eğer tablo boşsa (hiç veri yoksa), hiçbir şey yapma, olduğu gibi geri dön.
+        return df
+    df = df.copy() #tabloyu kopyala, bozulmasın diye
+    df.columns = [str(c).strip().lower() for c in df.columns] #kolon adlarını küçük harfe çevir, boşlukları kaldır
+    return df
+
+
+def ensure_time_index(df: pd.DataFrame) -> pd.DataFrame: #tablonun zaman (datetime) sütununu bul ve onu index yap,yani satırların sırasını tarihlere göre düzenle.
+
+    """
+    Ensure the dataframe has a datetime index named 'time'.
+    Tries common column names if 'time' is not already present.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    # If already indexed by datetime, keep it
+    if isinstance(df.index, pd.DatetimeIndex): #Eğer tablo zaten zaman indeksine sahipse (yani satırlar tarihlere göre sıralıysa),tekrar yapmaya gerek yok. Sadece indeksin adını ‘time’ yap ve dön.
+
+        df.index.name = "time"
+        return df
+
+    # Try common column names
+    for cand in ["time", "timestamp", "date", "datetime"]: #bunların hepsi datetime kolonu olabilir,ve kesin olarak tarih olarak algılamak için
+        if cand in df.columns:
+            df[cand] = pd.to_datetime(df[cand], errors="coerce") #kolonu datetime'a çeviriyor
+            df = df.set_index(cand).sort_index() #kolonu index yap, ve satırları tarihlere göre sırala
+            df.index.name = "time" #indeksin adını 'time' yap
+            return df
+
+    # As a fallback, try to parse the first column as datetime
+    first_col = df.columns[0] #ilk kolonu al, b planı gibi yukarıdaki indexler yoksa bu kolonu index yap
+    try:
+        df[first_col] = pd.to_datetime(df[first_col], errors="coerce") #kolonu datetime'a çeviriyor
+        df = df.set_index(first_col).sort_index() #kolonu index yap, ve satırları tarihlere göre sırala
+        df.index.name = "time" #indeksin adını 'time' yap
+    except Exception: #hata olursa hata mesajı yazdırıyor
+        print("[WARN] No datetime column found; downstream operations may fail.") #hata olursa hata mesajı yazdırıyor
+    return df
+
+
+# -----------------------------
+# Core Meteorological Ops
+# -----------------------------
+
+def compute_wind_speed(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute 10m wind speed from u10m and v10m components.
+    Accepts various common column names: 'u10', 'u10m', 'u_component_of_wind_10m', etc.
+    Adds a 'wind_speed_10m' column (m/s).
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    # Map possible aliases to standard keys
+    u_candidates = ["u10m", "u10", "u_component_of_wind_10m", "uas", "u_10m"] #olası kolon adlarınıa bakıyor
+    v_candidates = ["v10m", "v10", "v_component_of_wind_10m", "vas", "v_10m"]
+
+    def find_col(cands):
+        for c in cands: #kolon var mı diye kontrol ediyor
+            if c in df.columns:
+                return c
+        return None #kolon yoksa None döndürüyor
+
+    u_col = find_col(u_candidates) #u10m kolonunu bul
+    v_col = find_col(v_candidates) #v10m kolonunu bul
+
+    if u_col is None or v_col is None:
+        print("[WARN] Could not find both u10m and v10m columns. Wind speed won't be computed.") #hata olursa hata mesajı yazdırıyor
+        return df
+
+    # Wind speed magnitude
+    df["wind_speed_10m"] = np.sqrt(df[u_col] ** 2 + df[v_col] ** 2) #u10m ve v10m kolonlarının karelerini topla ve karekökünü al, yeni sütun ekleyerek rüzgar hızını buluyoruz
+
+    return df
+
+
+def add_temperature_c_if_present(df: pd.DataFrame) -> pd.DataFrame: #yukarıdaki işlemlerin aynısını sıcaklık var mı diye kontrol ediyor.
+    """
+    If a 2-meter temperature exists, normalize it to degrees Celsius.
+    Typical ERA5 column name is 't2m' (Kelvin). We convert to 't2m_c' if present.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    t_candidates = ["t2m", "t_2m", "temperature_2m", "t2m_k"]
+    t_col = None
+    for c in t_candidates:
+        if c in df.columns:
+            t_col = c
+            break
+
+    if t_col is not None:
+        # Assume Kelvin -> Celsius
+        df["t2m_c"] = df[t_col] - 273.15
+
+    return df
+
+
+# -----------------------------
+# Aggregations & Analyses
+# -----------------------------
+
+def monthly_averages(df: pd.DataFrame, value_cols=("wind_speed_10m", "t2m_c")) -> pd.DataFrame:
+    """
+    Compute monthly averages for the provided value columns.
+    Returns a DataFrame indexed by month start.
+    """
+    if df.empty:
+        return df
+
+    cols = [c for c in value_cols if c in df.columns] #istenen kolonları bul, eğer tablo sadece rüzgâr hızını içeriyorsa → sadece o sütunu alır.
+    if not cols:
+        print("[WARN] No requested columns found for monthly averages.") #hata olursa hata mesajı yazdırıyor
+        return pd.DataFrame()
+
+    return df[cols].resample("MS").mean() #aylık ortalamaları hesapla, resample("MS") = “month start” (her ayın başından itibaren gruplandır).
+
+
+def add_season_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a 'season' column (DJF, MAM, JJA, SON) based on month.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy() #tabloyu kopyala, bozulmasın diye
+    month_to_season = { #ayın mevsimine göre sütun ekliyoruz
+        12: "DJF", 1: "DJF", 2: "DJF",
+        3: "MAM", 4: "MAM", 5: "MAM",
+        6: "JJA", 7: "JJA", 8: "JJA", #ayın mevsimine göre sütun ekliyoruz
+        9: "SON", 10: "SON", 11: "SON",
+    }
+    df["season"] = df.index.month.map(month_to_season) #Tablonun tarih indeksinden ayın numarasını alıyor,ve koddaki sözlüğe göre mevsime çeviriyor.
+    return df
+
+
+def seasonal_averages(df: pd.DataFrame, value_cols=("wind_speed_10m", "t2m_c")) -> pd.DataFrame: #mevsimsel ortalamaları hesapla
+    """
+    Compute seasonal averages for the provided value columns.
+    """
+    if df.empty:
+        return df
+
+    df = add_season_column(df)
+    cols = [c for c in df.columns if c in value_cols] #istenen kolonları bul, eğer tablo sadece rüzgâr hızını veya sıcaklığını içeriyorsa → sadece o sütunları alır.
+    if not cols:
+        print("[WARN] No requested columns found for seasonal averages.")
+        return pd.DataFrame()
+
+    return df.groupby("season")[cols].mean().reindex(["DJF", "MAM", "JJA", "SON"]) #groupby("season") → aynı mevsimdekileri grupla. mean() → ortalamaları hesapla. reindex(["DJF", "MAM", "JJA", "SON"]) → mevsime göre sırala.
+
+
+def daily_extremes(df: pd.DataFrame, column: str = "wind_speed_10m", top_n: int = 5) -> pd.DataFrame: #günlük en extreme günleri bul, 5 gün içinde en yüksek rüzgar hızına sahip günleri bul.
+    """
+    Return the top-N extreme days by max daily value of a column (e.g., wind speed).
+    """
+    if df.empty or column not in df.columns:
+        return pd.DataFrame()
+
+#aşağıda veriyi günlere böldük ve grupladık makslarını aldık ve en yüksek değerli günleri bulduk.
+    daily_max = df[column].resample("D").max().to_frame(name=f"daily_max_{column}") #resample("D") → günlük grupla. max() → en yüksek değeri al. to_frame(name=f"daily_max_{column}") → sütun adını "daily_max_{column}" yap.
+    return daily_max.sort_values(by=f"daily_max_{column}", ascending=False).head(top_n) #Her günün en yüksek rüzgâr hızını bul, en fırtınalı 5 günü listele.
+
+
+def diurnal_profile(df: pd.DataFrame, column: str = "wind_speed_10m") -> pd.DataFrame: #günlük ortalama rüzgar hızını bul, 24 saatteki ortalama rüzgar hızını bul.
+    """
+    Compute the average diurnal (hour-of-day) profile for the given column.
+    Returns a Series indexed by hour 0..23.
+    """
+    if df.empty or column not in df.columns:
+        return pd.DataFrame()
+
+    grp = df[column].groupby(df.index.hour).mean() #groupby(df.index.hour) → saate göre grupla. mean() → ortalamaları hesapla. to_frame(name=f"mean_{column}") → sütun adını "mean_{column}" yap.
+    return grp.to_frame(name=f"mean_{column}") #sütun adını "mean_{column}" yap.
+
+
+# -----------------------------
+# Visualization
+# -----------------------------
+
+def plot_monthly_wind_series(monthly_ber: pd.DataFrame, monthly_muc: pd.DataFrame, outpath: Optional[str] = None) -> None: #aylık ortalama rüzgar hızını grafikle göster., outpath: Optional[str] = None → grafiği kaydetmek için
+    """
+    Plot monthly average wind speed for both cities in a single time series. 
+    NOTE: As per course plotting rules, we do not set any explicit colors or styles.
+    """
+    if monthly_ber.empty and monthly_muc.empty:
+        print("[WARN] No monthly data to plot.")
+        return
+
+    plt.figure(figsize=(10, 5)) #grafiği oluştur, figsize(10, 5) → grafiğin boyutunu 10x5 olarak ayarlar.
+    if not monthly_ber.empty and "wind_speed_10m" in monthly_ber.columns:
+        plt.plot(monthly_ber.index, monthly_ber["wind_speed_10m"], label="Berlin — Monthly mean WS (10m)") #Berlin'in aylık ortalama rüzgar hızını grafikle göster.
+    if not monthly_muc.empty and "wind_speed_10m" in monthly_muc.columns:
+        plt.plot(monthly_muc.index, monthly_muc["wind_speed_10m"], label="Munich — Monthly mean WS (10m)") #Munich'in aylık ortalama rüzgar hızını grafikle göster.
+
+    plt.title("Monthly Average 10m Wind Speed — Berlin vs Munich") #grafiğin başlığını "Aylık Ortalama 10m Rüzgar Hızı — Berlin vs Munich" olarak ayarlar.
+    plt.xlabel("Month")
+    plt.ylabel("Wind speed (m/s)")
+    plt.legend() #grafiğin legendini göster.
+    plt.tight_layout() #grafiğin yazıları kenara taşmasın diye ayarlar.
+    if outpath:
+        plt.savefig(outpath, dpi=200) #grafiği kaydet, dpi=200 → grafiğin çözünürlüğünü 200 olarak ayarlar.
+    plt.show() #grafiği göster.
+
+
+def plot_seasonal_bars(seasonal_ber: pd.DataFrame, seasonal_muc: pd.DataFrame, outpath: Optional[str] = None) -> None:
+    """
+    Plot seasonal comparison as grouped bars for wind speed.
+    """
+    if seasonal_ber.empty and seasonal_muc.empty:
+        print("[WARN] No seasonal data to plot.")
+        return
+
+    seasons = ["DJF", "MAM", "JJA", "SON"] #mevsimleri ayın numarasına göre sırala.
+    x = np.arange(len(seasons)) #mevsimlerin sayısını al, ve x eksenini oluştur.
+
+    ber = [seasonal_ber.loc[s, "wind_speed_10m"] if "wind_speed_10m" in seasonal_ber.columns and s in seasonal_ber.index else np.nan for s in seasons] #Berlin'in mevsimsel ortalama rüzgar hızını al, eğer mevsim yoksa NaN döndür.
+    muc = [seasonal_muc.loc[s, "wind_speed_10m"] if "wind_speed_10m" in seasonal_muc.columns and s in seasonal_muc.index else np.nan for s in seasons] #Munich'in mevsimsel ortalama rüzgar hızını al, eğer mevsim yoksa NaN döndür.
+
+    width = 0.35 #barların genişliğini 0.35 olarak ayarlar.
+
+    plt.figure(figsize=(10, 5)) #grafiği oluştur, figsize(10, 5) → grafiğin boyutunu 10x5 olarak ayarlar.
+    plt.bar(x - width/2, ber, width, label="Berlin — WS (10m)") #Berlin'in mevsimsel ortalama rüzgar hızını grafikle göster.
+    plt.bar(x + width/2, muc, width, label="Munich — WS (10m)") #Munich'in mevsimsel ortalama rüzgar hızını grafikle göster.
+    plt.xticks(x, seasons) #mevsimleri x eksenine göster.
+    plt.title("Seasonal Mean 10m Wind Speed — Berlin vs Munich") # grafiğin başlığını "Mevsimsel Ortalama 10m Rüzgar Hızı — Berlin vs Munich" olarak ayarlar.
+    plt.xlabel("Season") #x ekseninin başlığını "Mevsim" olarak ayarlar.
+    plt.ylabel("Wind speed (m/s)") #y ekseninin başlığını "Rüzgar Hızı (m/s)" olarak ayarlar.
+    plt.legend() #grafiğin legendini göster.
+    plt.tight_layout() #grafiğin yazıları kenara taşmasın diye ayarlar.
+    if outpath:
+        plt.savefig(outpath, dpi=200) #grafiği kaydet, dpi=200 → grafiğin çözünürlüğünü 200 olarak ayarlar.
+    plt.show() #grafiği göster.
+
+
+def plot_diurnal_profiles(diurnal_ber: pd.DataFrame, diurnal_muc: pd.DataFrame, outpath: Optional[str] = None) -> None: #günlük ortalama rüzgar hızını grafikle göster., outpath: Optional[str] = None → grafiği kaydetmek için
+    """
+    Plot diurnal average profiles for both cities on a single chart.
+    """
+    if diurnal_ber.empty and diurnal_muc.empty: #eğer günlük ortalama rüzgar hızı yoksa hata mesajı yazdırıyor.
+        print("[WARN] No diurnal data to plot.")
+        return
+
+    plt.figure(figsize=(10, 5)) #grafiği oluştur, figsize(10, 5) → grafiğin boyutunu 10x5 olarak ayarlar.
+    if not diurnal_ber.empty:
+        plt.plot(diurnal_ber.index, diurnal_ber.iloc[:, 0], marker="o", label="Berlin — mean WS (10m) by hour") #Marker: o → yuvarlak nokta her saat için o çizgi ile gösterilir, Berlin'in günlük ortalama rüzgar hızını grafikle göster.
+    if not diurnal_muc.empty:
+        plt.plot(diurnal_muc.index, diurnal_muc.iloc[:, 0], marker="o", label="Munich — mean WS (10m) by hour") #Munich'in günlük ortalama rüzgar hızını grafikle göster.
+
+    plt.title("Diurnal Profile of 10m Wind Speed — Berlin vs Munich") # grafiğin başlığını "Günlük Ortalama 10m Rüzgar Hızı — Berlin vs Munich" olarak ayarlar.
+    plt.xlabel("Hour of day (0–23)") #x ekseninin başlığını "Saat (0–23)" olarak ayarlar.
+    plt.ylabel("Wind speed (m/s)") #y ekseninin başlığını "Rüzgar Hızı (m/s)" olarak ayarlar.
+    plt.xticks(range(0, 24, 1)) #x eksenini 0'dan 24'e 1'er artırarak ayarlar.
+    plt.legend()
+    plt.tight_layout() #grafiğin yazıları kenara taşmasın diye ayarlar.
+    if outpath:
+        plt.savefig(outpath, dpi=200) #grafiği kaydet, dpi=200 → grafiğin çözünürlüğünü 200 olarak ayarlar.
+    plt.show() #grafiği göster.
+
+
+# -----------------------------
+# Cross-check with News (Placeholder)
+# -----------------------------
+
+def compare_extremes_with_news(extreme_dates: pd.Series) -> None: #extreme dates: en fırtınalı günleri bul, manuel olarak doğru mu diye not bırakıyoruz.
+    """
+    Placeholder function to compare extreme wind dates with external news.
+    In your report, you can search news for those dates and annotate findings.
+    This function prints dates to check.
+    """
+    if extreme_dates.empty: #eğer en fırtınalı günler yoksa hata mesajı yazdırıyor.
+        print("[INFO] No extreme dates to compare.") #hata mesajı yazdırıyor.
+        return
+
+    print("\n[Action] Cross-check these extreme wind dates with news or official bulletins:") #haberde arama yapıyoruz.
+    for dt in extreme_dates.index: #en fırtınalı günleri döngüye sokuyoruz.
+        # Print date in ISO format for easier searching
+        print(f"  - {dt.date()}") #tarihi ISO formatta yazdırıyoruz.
+    print("Tip: Use reputable sources (e.g., DWD, ECMWF, national met offices, major news outlets).") #güvenilir kaynakları kullanıyoruz.
+
+
+# -----------------------------
+# Orchestration
+# -----------------------------
+
+def load_and_prepare(path: str, city_name: str) -> pd.DataFrame: #veriyi oku, standartlaştır, zaman indeksi ayarla, rüzgar hızı hesapla, sıcaklık değiştir, şehir adı ekle.
+    """
+    Load, standardize, set time index, compute wind speed and convert temp.
+    Adds a 'city' column for later concatenation.
+    """
+    df = safe_read_csv(path) #veriyi oku, safe_read_csv(path) → veriyi oku, path: veri dosyasının yolu.
+    if df.empty:
+        print(f"[WARN] {city_name}: empty dataframe after read.")
+        return df
+
+    df = standardize_columns(df) #standartlaştır, standardize_columns(df) → standartlaştır, sütunların adlarını düzeltiyoruz.
+    df = ensure_time_index(df) #zaman indeksi ayarla, ensure_time_index(df) → zaman indeksi ayarla, zaman indeksini ayarlıyoruz.    
+    df = compute_wind_speed(df) #rüzgar hızı hesapla, compute_wind_speed(df) → rüzgar hızı hesapla, rüzgar hızını hesaplıyoruz.
+    df = add_temperature_c_if_present(df) #sıcaklık değiştir, add_temperature_c_if_present(df) → sıcaklık değiştir, sıcaklık değiştiriyoruz.
+    df["city"] = city_name #şehir adı ekle, df["city"] = city_name → şehir adı ekle, şehir adını ekleiyoruz.
+    return df
+
+
+def main(args: Optional[list[str]] = None) -> int: #string formatlı liste girecek 
+    parser = argparse.ArgumentParser(description="Lab 3 ERA5 Analysis — Berlin vs Munich") #argparse: terminalden parametreler almak için kullanılır.
+    parser.add_argument("--berlin", default="berlin_era5_wind_20241231_20241231.csv", help="Path to Berlin CSV") #berlin: berlin_era5_wind_20241231_20241231.csv dosyasının yolu.
+    parser.add_argument("--munich", default="munich_era5_wind_20241231_20241231.csv", help="Path to Munich CSV") #munich: munich_era5_wind_20241231_20241231.csv dosyasının yolu.
+    parser.add_argument("--savefigs", action="store_true", help="Save figures to PNG files") #savefigs: grafikleri PNG dosyasına kaydet.
+    parsed = parser.parse_args(args=args) #parametreleri al, parsed: parametreleri al, args: parametreler.
+
+    # --- Load / Prep
+    ber = load_and_prepare(parsed.berlin, "Berlin") #berlin: berlin_era5_wind_20241231_20241231.csv dosyasının yolu.
+    muc = load_and_prepare(parsed.munich, "Munich") #munich: munich_era5_wind_20241231_20241231.csv dosyasının yolu.
+
+    if ber.empty and muc.empty: #eğer berlin ve muc verisi yoksa hata mesajı yazdırıyor.
+        print("[FATAL] Both datasets are empty or missing. Exiting.") #hata mesajı yazdırıyor.
+        return 1 #1 döndürüyoruz.
+
+    # --- Basic exploration
+    for name, df in [("Berlin", ber), ("Munich", muc)]: #berlin ve muc verilerini döngüye sokuyoruz.
+        print(f"\n=== {name}: Basic Info ===")
+        if df.empty: #eğer veri yoksa hata mesajı yazdırıyor.
+            print("Empty dataframe.") #hata mesajı yazdırıyor.
+            continue #devam et.
+        print(df.info()) #veri bilgilerini yazdırıyoruz.
+        print("\nMissing values per column:") #sütunlardaki eksik değerleri yazdırıyoruz.
+        print(df.isna().sum()) #sütunlardaki eksik değerleri yazdırıyoruz.
+        print("\nSummary statistics (numeric):") #sayısal istatistikleri yazdırıyoruz.
+        print(df.describe()) #veri bilgilerini yazdırıyoruz.
+
+    # --- Aggregations
+    monthly_ber = monthly_averages(ber) #aylık ortalamaları hesapla, monthly_averages(ber) → aylık ortalamaları hesapla, berlin verisinin aylık ortalamalarını hesaplıyoruz.
+    monthly_muc = monthly_averages(muc) #aylık ortalamaları hesapla, monthly_averages(muc) → aylık ortalamaları hesapla, muc verisinin aylık ortalamalarını hesaplıyoruz.
+
+    seasonal_ber = seasonal_averages(ber) #mevsimsel ortalamaları hesapla, seasonal_averages(ber) → mevsimsel ortalamaları hesapla, berlin verisinin mevsimsel ortalamalarını hesaplıyoruz.
+    seasonal_muc = seasonal_averages(muc) #mevsimsel ortalamaları hesapla, seasonal_averages(muc) → mevsimsel ortalamaları hesapla, muc verisinin mevsimsel ortalamalarını hesaplıyoruz.
+
+    # --- Extremes (Top-5 max daily wind)
+    extremes_ber = daily_extremes(ber, column="wind_speed_10m", top_n=5) #günlük en extreme günleri bul, daily_extremes(ber) → günlük en extreme günleri bul, berlin verisinin günlük en extreme günlerini hesaplıyoruz.
+    extremes_muc = daily_extremes(muc, column="wind_speed_10m", top_n=5) #günlük en extreme günleri bul, daily_extremes(muc) → günlük en extreme günleri bul, muc verisinin günlük en extreme günlerini hesaplıyoruz.
+
+    print("\n=== Top-5 Extreme Wind Days — Berlin (by daily max 10m wind) ===") #en fırtınalı 5 günü yazdırıyoruz.
+    print(extremes_ber)
+    print("\n=== Top-5 Extreme Wind Days — Munich (by daily max 10m wind) ===") #en fırtınalı 5 günü yazdırıyoruz.
+    print(extremes_muc)
+
+    # --- Diurnal profiles
+    diurnal_ber = diurnal_profile(ber, column="wind_speed_10m") #günlük ortalama rüzgar hızını bul, diurnal_profile(ber) → günlük ortalama rüzgar hızını bul, berlin verisinin günlük ortalama rüzgar hızını hesaplıyoruz.
+    diurnal_muc = diurnal_profile(muc, column="wind_speed_10m") #günlük ortalama rüzgar hızını bul, diurnal_profile(muc) → günlük ortalama rüzgar hızını bul, muc verisinin günlük ortalama rüzgar hızını hesaplıyoruz.
+
+    # --- Plots
+    outdir = "figures" #grafikleri kaydetmek için klasör oluşturuyoruz.
+    if parsed.savefigs:
+        os.makedirs(outdir, exist_ok=True) #klasör oluştur, os.makedirs(outdir, exist_ok=True) → klasör oluştur, exist_ok=True → eğer klasör varsa oluşturma.
+
+    plot_monthly_wind_series(
+        monthly_ber, monthly_muc,
+        outpath=os.path.join(outdir, "monthly_wind_series.png") if parsed.savefigs else None #grafikleri kaydet, os.path.join(outdir, "monthly_wind_series.png") → grafikleri kaydet, outdir: klasör adı, "monthly_wind_series.png": grafik adı.
+    )
+
+    plot_seasonal_bars(
+        seasonal_ber, seasonal_muc,
+        outpath=os.path.join(outdir, "seasonal_bars.png") if parsed.savefigs else None #grafikleri kaydet, os.path.join(outdir, "seasonal_bars.png") → grafikleri kaydet, outdir: klasör adı, "seasonal_bars.png": grafik adı.
+    )
+
+    plot_diurnal_profiles(
+        diurnal_ber, diurnal_muc,
+        outpath=os.path.join(outdir, "diurnal_profiles.png") if parsed.savefigs else None #grafikleri kaydet, os.path.join(outdir, "diurnal_profiles.png") → grafikleri kaydet, outdir: klasör adı, "diurnal_profiles.png": grafik adı.
+    )
+
+    # --- Cross-check extremes with news (placeholder printout)
+    #     In your report, take these dates and verify with news sources.
+    compare_extremes_with_news(extremes_ber.iloc[:, 0] if not extremes_ber.empty else pd.Series(dtype=float)) #en fırtınalı günleri bul, compare_extremes_with_news(extremes_ber) → en fırtınalı günleri bul, berlin verisinin en fırtınalı günlerini hesaplıyoruz.
+    compare_extremes_with_news(extremes_muc.iloc[:, 0] if not extremes_muc.empty else pd.Series(dtype=float)) #en fırtınalı günleri bul, compare_extremes_with_news(extremes_muc) → en fırtınalı günleri bul, muc verisinin en fırtınalı günlerini hesaplıyoruz.
+
+    print("\n[Done] Analysis complete.") #analiz tamamlandı.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main()) #main fonksiyonunu çalıştır, raise SystemExit(main()) → main fonksiyonunu çalıştır, main: main fonksiyonu.
