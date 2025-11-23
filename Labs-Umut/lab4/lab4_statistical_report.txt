@@ -1,0 +1,50 @@
+Lab 4 Statistical Report
+========================================================================
+
+Concrete Strength – Descriptive Statistics
+- mean: 35.059999999999995
+- median: 34.2
+- mode: 31.8
+- std: 6.1626932325719315
+- var: 37.978787878787884
+- range: 25.3
+- iqr: 8.024999999999999
+- skew: 0.04730769580072309
+- kurtosis: -0.6747363072362496
+- q1: 31.1
+- q2_median: 34.2
+- q3: 39.125
+- min: 21.8
+- max: 47.1
+
+Fitted Distribution (Concrete Strength)
+- Type: normal
+- Mean (mu): 35.0600
+- Std (sigma): 6.1318
+
+Probability Scenarios
+- Bernoulli_mean: 0.970000
+- Bernoulli_var: 0.029100
+- Binomial_P(X=3): 0.139576
+- Binomial_P(X<=5): 0.615999
+- Poisson_P(X=8): 0.112599
+- Poisson_P(X>15): 0.048740
+- Uniform_mean_0_100: 50.000000
+- Uniform_var_0_100: 833.333333
+- Normal_P(X>280)_mu250_sigma15: 0.022750
+- Normal_95th_percentile_mu250_sigma15: 274.672804
+- Exponential_P(fail<=500h)_mean1000: 0.393469
+- Exponential_P(survive>1500h)_mean1000: 0.223130
+- Bayes_P(D|+): 0.333333
+
+Material Comparison (Summary)
+                  mean        std  count material_type
+Concrete        36.258   2.218668     50 Aluminum       196.632
+7.633290     50 Composite      299.042  10.384449     50 Steel
+399.098  10.398420     50
+
+Engineering Notes
+- Yüksek std/iqr kalite kontrol eşiklerini gözden gerektirir.
+- Mean≈Median ve düşük skew normalite varsayımı için olumlu bir işarettir.
+- Bayes ile düşük base-rate durumlarında yalancı-pozitif etkisi sayısallaşır.
+- Gruplar arası fark anlamlı ise proses varyasyon kaynaklarına bakılmalı.
